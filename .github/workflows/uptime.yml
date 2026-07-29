@@ -1,0 +1,94 @@
+name: uptime
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # best-effort; GitHub delivers 5–15 min
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check site (homepage + wp-login)
+        id: check
+        run: |
+          set -u
+          check_once() {
+            local fails=""
+            # 1) Homepage: what customers see. NOTE: served by LiteSpeed full-page cache,
+            #    so it can look healthy while PHP is dead — that's what check 2 is for.
+            local home
+            home=$(curl -sS -m 30 -A "kaally-uptime/1.0" -o /tmp/home.html -w "%{http_code}" https://kaally.com.au/ || echo "000")
+            if [ "$home" != "200" ] || ! grep -qi "kaally" /tmp/home.html; then
+              fails="${fails}homepage(HTTP ${home}) "
+            fi
+            # 2) wp-login.php: uncached, only renders if PHP + DB are alive.
+            local login
+            login=$(curl -sS -m 30 -A "kaally-uptime/1.0" -o /tmp/login.html -w "%{http_code}" https://kaally.com.au/wp-login.php || echo "000")
+            if [ "$login" != "200" ] || ! grep -qi "password" /tmp/login.html; then
+              fails="${fails}wp-login(HTTP ${login}) "
+            fi
+            echo "$fails"
+          }
+          STATUS=up
+          DETAIL=""
+          for attempt in 1 2 3; do
+            DETAIL=$(check_once)
+            if [ -z "$DETAIL" ]; then STATUS=up; break; fi
+            STATUS=down
+            [ "$attempt" -lt 3 ] && sleep 20
+          done
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "detail=$DETAIL" >> "$GITHUB_OUTPUT"
+
+      - name: Alert Telegram on transition only
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          NOW: ${{ steps.check.outputs.status }}
+          DETAIL: ${{ steps.check.outputs.detail }}
+        run: |
+          PREV=$(cat status/current 2>/dev/null || echo "up")
+          if [ "$PREV" = "$NOW" ]; then
+            echo "status unchanged ($NOW)"
+            exit 0
+          fi
+          if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_CHAT_ID:-}" ]; then
+            if [ "$NOW" = "down" ]; then
+              MSG="🔴 kaally.com.au is DOWN — ${DETAIL}(3 attempts over ~40s, from GitHub's runners)"
+            else
+              MSG="🟢 kaally.com.au RECOVERED"
+            fi
+            curl -sS -m 15 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT_ID}" --data-urlencode text="$MSG" > /dev/null || true
+          else
+            echo "TG secrets not set — transition ${PREV} -> ${NOW} NOT alerted"
+          fi
+          mkdir -p status && echo "$NOW" > status/current
+          git config user.name "kaally-uptime"
+          git config user.email "actions@users.noreply.github.com"
+          git add status/current
+          git commit -m "status: ${PREV} -> ${NOW}"
+          git pull --rebase || true
+          git push || true
+
+      - name: Keepalive (GitHub disables schedules after 60 idle days)
+        run: |
+          LAST=$(git log -1 --format=%ct)
+          AGE_DAYS=$(( ( $(date +%s) - LAST ) / 86400 ))
+          if [ "$AGE_DAYS" -ge 45 ]; then
+            git config user.name "kaally-uptime"
+            git config user.email "actions@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive"
+            git pull --rebase || true
+            git push || true
+          fi
