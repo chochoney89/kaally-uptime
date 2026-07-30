@@ -1,0 +1,146 @@
+name: uptime
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # best-effort; GitHub delivers 5–15 min, sometimes later under load
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: 'Send a test Telegram alert (no state change, no site check)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # pinned to a full SHA (v4.2.2) — mutable major tags are a supply-chain hole
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Test alert only (manual dispatch)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_alert }}
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          set -u
+          [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_CHAT_ID:-}" ] || { echo "secrets not set"; exit 1; }
+          resp=$(curl -sS -m 15 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" --data-urlencode text="🧪 kaally-uptime test alert — wiring OK")
+          echo "$resp" | grep -q '"ok":true' || { echo "Telegram send failed: $resp"; exit 1; }
+          echo "test alert sent — exiting without touching state"
+
+      - name: Check site (homepage + wp-login)
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.test_alert) }}
+        id: check
+        run: |
+          set -u
+          check_once() {
+            local fails=""
+            # 1) Homepage: what customers see. NOTE: served by LiteSpeed full-page cache,
+            #    so it can look healthy while PHP is dead — that's what check 2 is for.
+            local rc=0 home="000"
+            home=$(curl -sS -m 30 -A "kaally-uptime/1.1" -o /tmp/home.html -w "%{http_code}" https://kaally.com.au/) || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              fails="${fails}homepage(curl-rc${rc}) "
+            elif [ "$home" != "200" ] || ! grep -qi "kaally" /tmp/home.html; then
+              fails="${fails}homepage(HTTP-${home}) "
+            fi
+            # 2) wp-login.php: uncached, only renders if PHP + DB are alive. Stable marker.
+            rc=0; local login="000"
+            login=$(curl -sS -m 30 -A "kaally-uptime/1.1" -o /tmp/login.html -w "%{http_code}" https://kaally.com.au/wp-login.php) || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              fails="${fails}wp-login(curl-rc${rc}) "
+            elif [ "$login" != "200" ] || ! grep -q 'id="loginform"' /tmp/login.html; then
+              fails="${fails}wp-login(HTTP-${login}) "
+            fi
+            echo "$fails"
+          }
+          STATUS=up
+          DETAIL=""
+          for attempt in 1 2 3; do
+            DETAIL=$(check_once)
+            if [ -z "$DETAIL" ]; then STATUS=up; break; fi
+            STATUS=down
+            [ "$attempt" -lt 3 ] && sleep 20
+          done
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "detail=$DETAIL" >> "$GITHUB_OUTPUT"
+          echo "ts=$(date -u +%Y-%m-%dT%H:%MZ)" >> "$GITHUB_OUTPUT"
+
+      # Observed state and notified state are SEPARATE: a transition is only "consumed" when
+      # Telegram confirms ok:true. Missing secrets / a failed send leave it pending, so the next
+      # run retries the alert instead of silently swallowing a DOWN forever.
+      - name: Alert on unnotified transition, persist state
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.test_alert) }}
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          NOW: ${{ steps.check.outputs.status }}
+          DETAIL: ${{ steps.check.outputs.detail }}
+          TS: ${{ steps.check.outputs.ts }}
+        run: |
+          set -u
+          mkdir -p status
+          OBSERVED_PREV=$(cat status/current 2>/dev/null || echo "up")
+          NOTIFIED=$(cat status/notified 2>/dev/null || echo "up")
+
+          ALERT_FAILED=0
+          if [ "$NOW" != "$NOTIFIED" ]; then
+            if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_CHAT_ID:-}" ]; then
+              if [ "$NOW" = "down" ]; then
+                MSG="🔴 kaally.com.au is DOWN — ${DETAIL}(${TS}, 3 attempts over ~40s, from GitHub's runners)"
+              else
+                MSG="🟢 kaally.com.au RECOVERED (${TS})"
+              fi
+              RESP=$(curl -sS -m 15 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                -d chat_id="${TG_CHAT_ID}" --data-urlencode text="$MSG" || echo "curl-failed")
+              if echo "$RESP" | grep -q '"ok":true'; then
+                echo "$NOW" > status/notified
+              else
+                echo "Telegram send FAILED, transition stays pending: $RESP"
+                ALERT_FAILED=1
+              fi
+            else
+              echo "TG secrets not set — transition to ${NOW} stays PENDING until they exist"
+              ALERT_FAILED=1
+            fi
+          fi
+
+          echo "$NOW" > status/current
+          echo "${TS} observed=${NOW} notified=$(cat status/notified 2>/dev/null || echo up) detail=${DETAIL}" > status/last_change
+
+          if [ -n "$(git status --porcelain status/)" ]; then
+            git config user.name "kaally-uptime"
+            git config user.email "actions@users.noreply.github.com"
+            git add status/
+            git commit -m "status: observed=${NOW} (was ${OBSERVED_PREV}), notified=$(cat status/notified 2>/dev/null || echo up) ${TS}"
+            PUSHED=0
+            for i in 1 2 3; do
+              if git push; then PUSHED=1; break; fi
+              git pull --rebase || true
+              sleep 5
+            done
+            [ "$PUSHED" = "1" ] || { echo "could not persist state after 3 attempts"; exit 1; }
+          fi
+
+          [ "$ALERT_FAILED" = "0" ] || exit 1   # visible red run = alert not delivered yet
+
+      - name: Keepalive (GitHub disables schedules after 60 idle days)
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.test_alert) }}
+        run: |
+          LAST=$(git log -1 --format=%ct)
+          AGE_DAYS=$(( ( $(date +%s) - LAST ) / 86400 ))
+          if [ "$AGE_DAYS" -ge 45 ]; then
+            git config user.name "kaally-uptime"
+            git config user.email "actions@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive"
+            git push || { git pull --rebase && git push; }
+          fi
